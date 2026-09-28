@@ -156,5 +156,97 @@ class ErrorAttributeTests(unittest.TestCase):
         self.assertEqual((err.text, err.codepoint, err.position), ("abc\u0141", 0x141, 4))
 
 
+class OverlongInputErrorTests(unittest.TestCase):
+    """超长标签/域名抛出的异常类型与 code。"""
+
+    def test_overlong_label_is_plain_idnaerror(self):
+        # 63 字节上限：ASCII 超 64 字符，或 Punycode 展开后超 63 字节，
+        # 抛的都是 IDNAError 本身，不是 InvalidCodepoint 等子类。
+        for label in ("a" * 64, "中" * 58):
+            with self.subTest(label=label[:4]):
+                with self.assertRaises(idna.IDNAError) as ctx:
+                    idna.alabel(label)
+                err = ctx.exception
+                self.assertIs(type(err), idna.IDNAError)
+                self.assertEqual(err.code, "label_too_long")
+        # 恰好 63 字节的 A-label 合法。
+        self.assertEqual(idna.alabel("中" * 57), b"xn--fiq" + b"a" * 56)
+
+    def test_check_label_uses_domain_length_bound(self):
+        # check_label 自身按 254 字符（域名上限）截断，不是 63 字节；
+        # 63 字节的标签限制是 alabel 在 Punycode 编码之后才检查的。
+        idna.check_label("é" * 100)
+        idna.check_label("é" * 254)
+        with self.assertRaises(idna.IDNAError) as ctx:
+            idna.check_label("é" * 255)
+        self.assertEqual(ctx.exception.code, "label_too_long")
+
+    def test_overlong_domain_and_input(self):
+        with self.assertRaises(idna.IDNAError) as ctx:
+            idna.encode(".".join(["a" * 63] * 4))
+        self.assertEqual(ctx.exception.code, "domain_too_long")
+        with self.assertRaises(idna.IDNAError) as ctx:
+            idna.encode("a" * 1025)
+        self.assertEqual(ctx.exception.code, "input_too_long")
+
+
+class MixedScriptErrorTests(unittest.TestCase):
+    """混合脚本输入的报错类型——网关按异常类型降级时以这里为准。"""
+
+    def test_exception_hierarchy(self):
+        # 降级逻辑注意：三个具体异常都是 IDNAError 的子类，彼此之间
+        # 没有继承关系；用 isinstance 分类时子类必须先于 IDNAError 判断。
+        for cls in (idna.IDNABidiError, idna.InvalidCodepoint, idna.InvalidCodepointContext):
+            self.assertTrue(issubclass(cls, idna.IDNAError))
+        self.assertFalse(issubclass(idna.IDNABidiError, idna.InvalidCodepoint))
+        self.assertFalse(issubclass(idna.InvalidCodepointContext, idna.InvalidCodepoint))
+        self.assertFalse(issubclass(idna.InvalidCodepoint, idna.InvalidCodepointContext))
+
+    def test_latin_plus_rtl_is_bidi_error(self):
+        # 拉丁混希伯来：不是“非法码位”，而是 Bidi Rule 冲突。
+        with self.assertRaises(idna.IDNABidiError) as ctx:
+            idna.alabel("a\u05d0")
+        self.assertEqual(ctx.exception.code, "bidi_rule_5")
+        with self.assertRaises(idna.IDNABidiError) as ctx:
+            idna.alabel("\u05d0a")
+        self.assertEqual(ctx.exception.code, "bidi_rule_2")
+
+    def test_greek_plus_cyrillic_is_valid(self):
+        # 反直觉但正确：IDNA 2008 不检查“混脚本”本身，希腊+西里尔合法。
+        # 网关此前把这类输入预期为 InvalidCodepoint——是预期写错了。
+        self.assertEqual(idna.alabel("αб"), b"xn--mxa0x")
+
+    def test_mixed_arabic_digit_families_is_contexto(self):
+        # 阿拉伯-印度数字与扩展阿拉伯-印度数字混用 → CONTEXTO 规则。
+        with self.assertRaises(idna.InvalidCodepointContext) as ctx:
+            idna.alabel("\u0661\u06f2")
+        self.assertEqual(ctx.exception.code, "contexto")
+
+    def test_joiner_between_latin_is_contextj(self):
+        with self.assertRaises(idna.InvalidCodepointContext) as ctx:
+            idna.alabel("a\u200cb")
+        self.assertEqual(ctx.exception.code, "contextj")
+
+    def test_disallowed_codepoint(self):
+        with self.assertRaises(idna.InvalidCodepoint) as ctx:
+            idna.alabel("abc\u0141")
+        self.assertEqual(ctx.exception.code, "disallowed_codepoint")
+
+    def test_exact_type_per_trigger(self):
+        # 每类输入只落一种异常类型，且类型精确（不是其子类/父类）。
+        triggers = [
+            (lambda: idna.alabel("a" * 64), idna.IDNAError),
+            (lambda: idna.alabel("a\u05d0"), idna.IDNABidiError),
+            (lambda: idna.alabel("a\u200cb"), idna.InvalidCodepointContext),
+            (lambda: idna.alabel("\u0661\u06f2"), idna.InvalidCodepointContext),
+            (lambda: idna.alabel("abc\u0141"), idna.InvalidCodepoint),
+        ]
+        for trigger, exact in triggers:
+            with self.subTest(exact=exact.__name__):
+                with self.assertRaises(idna.IDNAError) as ctx:
+                    trigger()
+                self.assertIs(type(ctx.exception), exact)
+
+
 if __name__ == "__main__":
     unittest.main()

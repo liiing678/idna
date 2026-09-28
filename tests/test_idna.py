@@ -1,7 +1,9 @@
+import codecs
 import unittest
 import warnings
 
 import idna
+import idna.codec
 
 
 class IDNATests(unittest.TestCase):
@@ -587,6 +589,163 @@ class IDNATests(unittest.TestCase):
             idna.decode(b"a.b.c.xn--pokxncvks", display=True),
             "a.b.c.xn--pokxncvks",
         )
+
+
+class CheckBidiConditionTests(unittest.TestCase):
+    """check_bidi 的判定条件：何时启用、走 RTL/LTR 哪条路径、各规则触发点。"""
+
+    def test_no_rtl_characters_skips_all_rules(self):
+        # 标签不含 R/AL/AN 方向字符且 check_ltr=False 时，规则 1-6 全部
+        # 跳过——即使标签以连字符结尾也直接通过（连字符由 check_hyphen_ok
+        # 负责，不在 bidi 规则范围内）。
+        self.assertTrue(idna.check_bidi("abc"))
+        self.assertTrue(idna.check_bidi("a-"))
+
+    def test_check_ltr_enforces_rules_on_ltr_labels(self):
+        self.assertTrue(idna.check_bidi("a1", check_ltr=True))
+        with self.assertRaises(idna.IDNABidiError) as ctx:
+            idna.check_bidi("a-", check_ltr=True)
+        self.assertEqual(ctx.exception.code, "bidi_rule_6")
+
+    def test_first_character_selects_rtl_or_ltr_path(self):
+        # 首字符方向决定按 RTL 还是 LTR 规则校验；首字符必须是 L、R 或 AL，
+        # 以数字（EN）开头直接违反规则 1。
+        with self.assertRaises(idna.IDNABidiError) as ctx:
+            idna.check_bidi("1\u05d0")
+        self.assertEqual(ctx.exception.code, "bidi_rule_1")
+
+    def test_rtl_label_rules(self):
+        # 规则 2：RTL 标签中不允许 L 方向字符。
+        with self.assertRaises(idna.IDNABidiError) as ctx:
+            idna.check_bidi("\u05d0a")
+        self.assertEqual(ctx.exception.code, "bidi_rule_2")
+        # 规则 4：同一 RTL 标签中不能混用 AN 与 EN 两套数字。
+        with self.assertRaises(idna.IDNABidiError) as ctx:
+            idna.check_bidi("\u05d0\u06601")
+        self.assertEqual(ctx.exception.code, "bidi_rule_4")
+        # 规则 3：结尾（不计 NSM）必须是 R/AL/EN/AN；NSM 结尾合法。
+        self.assertTrue(idna.check_bidi("\u05d0\u05d1\u0301"))
+        self.assertTrue(idna.check_bidi("\u05d01"))
+
+
+class CheckInitialCombinerTests(unittest.TestCase):
+    """check_initial_combiner 的判定条件：仅检查首字符是否为 Mark 类别。"""
+
+    def test_empty_and_non_mark_labels_pass(self):
+        self.assertTrue(idna.check_initial_combiner(""))
+        self.assertTrue(idna.check_initial_combiner("abc"))
+
+    def test_combining_mark_only_checked_at_start(self):
+        self.assertTrue(idna.check_initial_combiner("a\u0301"))
+
+    def test_any_mark_category_at_start_fails(self):
+        # Mn/Mc/Me 三种 Mark 类别（category 以 M 开头）一律拒绝；
+        # 抛出的是 IDNAError 本身，不是 InvalidCodepoint 子类。
+        for cp in (0x0301, 0x0903, 0x20E1):
+            with self.subTest(cp=f"U+{cp:04X}"):
+                with self.assertRaises(idna.IDNAError) as ctx:
+                    idna.check_initial_combiner(chr(cp) + "a")
+                self.assertIs(type(ctx.exception), idna.IDNAError)
+                self.assertEqual(ctx.exception.code, "leading_combiner")
+
+
+class ValidContextJTests(unittest.TestCase):
+    """valid_contextj 的判定条件（RFC 5892 Appendix A.1/A.2）。"""
+
+    def test_zwnj_allowed_after_virama(self):
+        # A.1 第一条：前一字符的 combining class 为 9（virama）即可。
+        self.assertTrue(idna.valid_contextj("\u0915\u094d\u200c\u0937", 2))
+
+    def test_zwnj_allowed_between_cursive_joiners(self):
+        # A.1 第二条：向前（跳过 T 透明字符）须遇到 L/D 连接类型，
+        # 向后（同样跳过 T）须遇到 R/D 连接类型。
+        self.assertTrue(idna.valid_contextj("\u0626\u200c\u0626", 1))
+        self.assertTrue(idna.valid_contextj("\u0626\u064e\u200c\u0626", 2))
+
+    def test_zwnj_rejected_between_latin_letters(self):
+        self.assertFalse(idna.valid_contextj("a\u200cb", 1))
+        # 前向扫描跳过 T 后落在非连接字符上，同样不成立。
+        self.assertFalse(idna.valid_contextj("a\u064e\u200c\u0626", 2))
+
+    def test_zwj_only_allowed_after_virama(self):
+        # A.2：ZWJ 只有紧跟 virama 一种合法情形。
+        self.assertTrue(idna.valid_contextj("\u0915\u094d\u200d\u0937", 2))
+        self.assertFalse(idna.valid_contextj("\u0626\u200d\u0626", 1))
+
+    def test_non_joiner_and_edge_positions(self):
+        self.assertFalse(idna.valid_contextj("ab", 0))
+        self.assertFalse(idna.valid_contextj("\u200cab", 0))
+
+
+class IncrementalDecoderBufferTests(unittest.TestCase):
+    """idna2008 IncrementalDecoder 对跨块（半截）标签的缓冲行为。
+
+    结论：最后一个不完整的标签不会被解码，而是留在 buffer 里等下一块；
+    只有看到标签分隔符（四种 Unicode 点号之一）或 final=True 时才解码。
+    因此流式解码与一次性 decode 的结果完全一致，无需整串重解。
+    """
+
+    def setUp(self):
+        self.decoder = codecs.getincrementaldecoder("idna2008")()
+
+    def test_partial_label_is_buffered_not_decoded(self):
+        # 半截 A-label 不产生任何输出，原样留在 buffer 中。
+        self.assertEqual(self.decoder.decode(b"xn--fa-"), "")
+        self.assertEqual(self.decoder.buffer, b"xn--fa-")
+        # 空输入不会刷新 buffer。
+        self.assertEqual(self.decoder.decode(b""), "")
+        self.assertEqual(self.decoder.buffer, b"xn--fa-")
+
+    def test_label_decoded_when_separator_arrives(self):
+        self.assertEqual(self.decoder.decode(b"xn--fa-"), "")
+        # 下一块补全标签并带来分隔符：完整标签立即解码，分隔符归一化为 "."
+        self.assertEqual(self.decoder.decode(b"hia."), "faß.")
+        self.assertEqual(self.decoder.buffer, b"")
+        # 分隔符之后又开始新的缓冲
+        self.assertEqual(self.decoder.decode(b"de"), "")
+        self.assertEqual(self.decoder.buffer, b"de")
+        self.assertEqual(self.decoder.decode(b"", True), "de")
+        self.assertEqual(self.decoder.buffer, b"")
+
+    def test_final_flushes_partial_label(self):
+        self.assertEqual(self.decoder.decode(b"xn--fa-"), "")
+        self.assertEqual(self.decoder.decode(b"hia.de", True), "faß.de")
+
+    def test_every_split_point_matches_oneshot(self):
+        data = b"xn--fa-hia.xn--zckzah"
+        expected = idna.decode(data)
+        for n in range(1, len(data)):
+            with self.subTest(split=n):
+                self.decoder.reset()
+                out = self.decoder.decode(data[:n]) + self.decoder.decode(data[n:], True)
+                self.assertEqual(out, expected)
+
+    def test_invalid_label_surfaces_at_final(self):
+        # 半截标签在 final=True 时才校验，非法输入在此时抛出。
+        self.assertEqual(self.decoder.decode(b"xn--fa-"), "")
+        with self.assertRaises(idna.IDNAError) as ctx:
+            self.decoder.decode(b"", True)
+        self.assertEqual(ctx.exception.code, "invalid_alabel")
+
+    def test_getstate_setstate_resumes_mid_label(self):
+        self.assertEqual(self.decoder.decode(b"xn--fa-"), "")
+        state = self.decoder.getstate()
+        other = codecs.getincrementaldecoder("idna2008")()
+        other.setstate(state)
+        self.assertEqual(other.decode(b"hia.de", True), "faß.de")
+
+    def test_reset_clears_buffer(self):
+        self.decoder.decode(b"xn--fa-")
+        self.decoder.reset()
+        self.assertEqual(self.decoder.buffer, b"")
+        self.assertEqual(self.decoder.decode(b"xn--zckzah", True), "\u30c6\u30b9\u30c8")
+
+    def test_domain_length_limit_enforced_across_chunks(self):
+        # 254 字符的输入上限按累计输入计算，跨块超限同样抛 domain_too_long。
+        self.assertEqual(self.decoder.decode(b"a" * 200), "")
+        with self.assertRaises(idna.IDNAError) as ctx:
+            self.decoder.decode(b"b" * 100)
+        self.assertEqual(ctx.exception.code, "domain_too_long")
 
 
 class UnicodeVersionTests(unittest.TestCase):
